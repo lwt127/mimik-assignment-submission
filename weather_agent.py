@@ -19,7 +19,7 @@ class Settings:
         "MIMIK_BASE_URL", "http://192.168.0.120:8083/mimik-ai/openai/v1"
     )
     mimik_api_key: str = os.getenv("MIMIK_API_KEY", "1234")
-    mimik_model: str = os.getenv("MIMIK_MODEL", "smollm-360m")
+    mimik_model: str = os.getenv("MIMIK_MODEL", "qwen3-4b")
     request_timeout: float = float(os.getenv("REQUEST_TIMEOUT", "30"))
 
 
@@ -62,8 +62,57 @@ class WeatherAgent:
         return self._summarize(question, place, weather)
 
     def _is_weather_question(self, question: str) -> bool:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Classify whether the user is asking about weather or conditions "
+                    "affected by weather, such as needing an umbrella. Return only JSON "
+                    'in this exact format: {"is_weather": true} or '
+                    '{"is_weather": false}.'
+                ),
+            },
+            {"role": "user", "content": question},
+        ]
+        try:
+            answer = self._chat_completion(messages, temperature=0)
+            match = re.search(
+                r'\{\s*"is_weather"\s*:\s*(true|false)\s*\}',
+                answer,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                return match.group(1).lower() == "true"
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
+
         words = set(re.findall(r"[a-z]+", question.lower()))
         return bool(words & self.WEATHER_TERMS)
+
+    def _chat_completion(
+        self,
+        messages: list[Dict[str, str]],
+        temperature: float,
+    ) -> str:
+        body = json.dumps(
+            {
+                "model": self.settings.mimik_model,
+                "messages": messages,
+                "temperature": temperature,
+                "stream": False,
+            }
+        ).encode("utf-8")
+        request = Request(
+            f"{self.settings.mimik_base_url.rstrip('/')}/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.settings.mimik_api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        payload = self._request_json(request)
+        return str(payload["choices"][0]["message"]["content"]).strip()
 
     def _extract_location(self, question: str) -> Optional[str]:
         normalized = question.strip().rstrip("?.!")
@@ -147,26 +196,8 @@ class WeatherAgent:
                 ),
             },
         ]
-        body = json.dumps(
-            {
-                "model": self.settings.mimik_model,
-                "messages": messages,
-                "temperature": 0.2,
-                "stream": False,
-            }
-        ).encode("utf-8")
-        request = Request(
-            f"{self.settings.mimik_base_url.rstrip('/')}/chat/completions",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {self.settings.mimik_api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        payload = self._request_json(request)
         try:
-            answer = str(payload["choices"][0]["message"]["content"]).strip()
+            answer = self._chat_completion(messages, temperature=0.2)
         except (KeyError, IndexError, TypeError) as error:
             raise RuntimeError("mimOE returned an unexpected response.") from error
 
