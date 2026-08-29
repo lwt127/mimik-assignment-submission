@@ -156,6 +156,10 @@ class WeatherAgent:
                     "temperature_2m,apparent_temperature,relative_humidity_2m,"
                     "precipitation,weather_code,wind_speed_10m"
                 ),
+                "daily": (
+                    "precipitation_probability_max,precipitation_sum,weather_code"
+                ),
+                "forecast_days": 2,
                 "timezone": "auto",
             }
         )
@@ -165,6 +169,8 @@ class WeatherAgent:
             raise RuntimeError("The weather service returned no current conditions.")
         weather = dict(payload["current"])
         weather["_units"] = payload.get("current_units", {})
+        weather["_daily"] = payload.get("daily", {})
+        weather["_daily_units"] = payload.get("daily_units", {})
         return weather
 
     def _summarize(
@@ -182,10 +188,11 @@ class WeatherAgent:
             {
                 "role": "system",
                 "content": (
-                    "You are a concise weather assistant. Write one sentence using only the "
-                    "supplied Open-Meteo observation. Include the exact temperature and say "
-                    "that these are current conditions. Never name another provider, describe "
-                    "the interval, or add facts that are absent from the JSON."
+                    "You are a concise weather assistant. Directly answer the user's specific "
+                    "question using only the supplied Open-Meteo observation and forecast. "
+                    "For a yes/no rain question, begin with whether rain is expected and cite "
+                    "the forecast probability. Otherwise, include the exact current temperature. "
+                    "Never name another provider, describe the interval, or invent facts."
                 ),
             },
             {
@@ -204,16 +211,43 @@ class WeatherAgent:
         temperature = str(weather.get("temperature_2m", ""))
         rejected_terms = ("weather underground", "interval", "provider", "source api")
         normalized = answer.lower()
+        rain_question = bool(re.search(r"\b(?:rain|raining|umbrella)\b", question.lower()))
+        forecast_index = 1 if "tomorrow" in question.lower() else 0
+        probabilities = weather.get("_daily", {}).get(
+            "precipitation_probability_max", []
+        )
+        forecast_probability = (
+            str(probabilities[forecast_index])
+            if forecast_index < len(probabilities)
+            else None
+        )
+        direct_rain_answer = "rain" in normalized and any(
+            term in normalized for term in ("expected", "likely", "unlikely", "chance")
+        )
+        grounded_rain_answer = (
+            direct_rain_answer
+            and forecast_probability is not None
+            and forecast_probability in answer
+        )
         if (
-            temperature not in answer
-            or "current" not in normalized
+            (not rain_question and temperature not in answer)
+            or (not rain_question and "current" not in normalized)
+            or (rain_question and not grounded_rain_answer)
             or any(term in normalized for term in rejected_terms)
             or len(answer) > 400
         ):
-            return self._fallback_summary(place_name, weather)
+            return self._fallback_summary(question, place_name, weather)
         return answer
 
-    def _fallback_summary(self, place_name: str, weather: Dict[str, Any]) -> str:
+    def _fallback_summary(
+        self,
+        question: str,
+        place_name: str,
+        weather: Dict[str, Any],
+    ) -> str:
+        if re.search(r"\b(?:rain|raining|umbrella)\b", question.lower()):
+            return self._rain_summary(question, place_name, weather)
+
         units = weather.get("_units", {})
         temperature_unit = units.get("temperature_2m", "C")
         wind_unit = units.get("wind_speed_10m", "km/h")
@@ -224,4 +258,30 @@ class WeatherAgent:
             f"{weather.get('relative_humidity_2m')}% humidity, "
             f"{weather.get('precipitation')} {precipitation_unit} precipitation, "
             f"and wind at {weather.get('wind_speed_10m')} {wind_unit}."
+        )
+
+    def _rain_summary(
+        self,
+        question: str,
+        place_name: str,
+        weather: Dict[str, Any],
+    ) -> str:
+        daily = weather.get("_daily", {})
+        daily_units = weather.get("_daily_units", {})
+        period = "tomorrow" if "tomorrow" in question.lower() else "today"
+        index = 1 if period == "tomorrow" else 0
+        probabilities = daily.get("precipitation_probability_max", [])
+        totals = daily.get("precipitation_sum", [])
+        if index >= len(probabilities) or index >= len(totals):
+            return f"A {period} rain forecast is unavailable for {place_name}."
+
+        probability = probabilities[index]
+        total = totals[index]
+        expected = probability >= 50 or total > 0.1
+        verdict = "Rain is expected" if expected else "Rain is not expected"
+        probability_unit = daily_units.get("precipitation_probability_max", "%")
+        total_unit = daily_units.get("precipitation_sum", "mm")
+        return (
+            f"{verdict} {period} in {place_name}: the maximum rain chance is "
+            f"{probability}{probability_unit}, with {total} {total_unit} forecast."
         )

@@ -26,8 +26,9 @@ I chose raw Python HTTP calls instead of LangChain, CrewAI, or another agent fra
 1. The local Qwen model classifies the user's intent as weather or non-weather using structured JSON.
 2. The location is extracted from accepted weather questions.
 3. Open-Meteo geocodes the location and returns current conditions.
-4. The observation is sent to the same local mimOE `/chat/completions` endpoint.
-5. Qwen turns the structured observation into a concise answer.
+4. Open-Meteo returns current conditions plus today/tomorrow rain forecasts.
+5. The observation is sent to the same local mimOE `/chat/completions` endpoint.
+6. Qwen turns the structured observation into a concise answer; output validation falls back to the exact forecast when needed.
 
 This separates factual data retrieval from language generation. The model does not need to know live weather and is explicitly instructed not to invent data.
 
@@ -125,6 +126,6 @@ GitHub only offers a check in the required-checks list after the workflow has ru
 ## Limitations and next steps
 
 - Location extraction intentionally handles simple English phrasing; a production version should use structured model output or a geospatial parser.
-- The current version reports current conditions, not a multi-day forecast.
+- The current version reports current conditions and direct rain guidance for today or tomorrow, not a general multi-day forecast.
 - Open-Meteo requires internet access, although model inference remains entirely local.
 - The development API key is suitable only for this local demonstration. A real deployment should use a rotated secret and restrict network exposure.

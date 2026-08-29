@@ -57,7 +57,22 @@ class RecordingOpener:
                         "precipitation": 0,
                         "weather_code": 2,
                         "wind_speed_10m": 6.1,
-                    }
+                    },
+                    "current_units": {
+                        "temperature_2m": "C",
+                        "precipitation": "mm",
+                        "wind_speed_10m": "km/h",
+                    },
+                    "daily": {
+                        "time": ["2026-08-29", "2026-08-30"],
+                        "precipitation_probability_max": [20, 75],
+                        "precipitation_sum": [0.0, 4.2],
+                        "weather_code": [2, 61],
+                    },
+                    "daily_units": {
+                        "precipitation_probability_max": "%",
+                        "precipitation_sum": "mm",
+                    },
                 }
             )
         request_payload = json.loads(request.data.decode("utf-8"))
@@ -110,9 +125,9 @@ class WeatherAgentTests(unittest.TestCase):
     def test_connects_weather_data_to_mimoe_chat_completion(self):
         answer = self.agent.answer("Will it rain in Vancouver today?")
 
-        self.assertEqual(
-            answer, "Vancouver is currently 18.2 C with no precipitation."
-        )
+        self.assertIn("Rain is not expected today", answer)
+        self.assertIn("20%", answer)
+        self.assertIn("0.0 mm", answer)
         self.assertEqual(len(self.opener.requests), 4)
 
         geocode_request, _ = self.opener.requests[1]
@@ -138,9 +153,17 @@ class WeatherAgentTests(unittest.TestCase):
 
         answer = agent.answer("Should I bring an umbrella in Vancouver?")
 
-        self.assertIn("Vancouver is currently", answer)
+        self.assertIn("Rain is not expected today", answer)
+        self.assertIn("20%", answer)
         classifier_payload = json.loads(opener.requests[0][0].data.decode("utf-8"))
         self.assertEqual(classifier_payload["temperature"], 0)
+
+    def test_rain_question_uses_tomorrow_forecast_when_requested(self):
+        answer = self.agent.answer("Will it rain in Vancouver tomorrow?")
+
+        self.assertIn("Rain is expected tomorrow", answer)
+        self.assertIn("75%", answer)
+        self.assertIn("4.2 mm", answer)
 
     def test_falls_back_when_local_model_invents_a_provider(self):
         opener = RecordingOpener(
