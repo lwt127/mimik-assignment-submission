@@ -1,0 +1,196 @@
+"""Weather-only agent powered by a local mimOE OpenAI-compatible endpoint."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+JsonOpener = Callable[[Request], Any]
+
+
+@dataclass(frozen=True)
+class Settings:
+    mimik_base_url: str = os.getenv(
+        "MIMIK_BASE_URL", "http://192.168.0.120:8083/mimik-ai/openai/v1"
+    )
+    mimik_api_key: str = os.getenv("MIMIK_API_KEY", "1234")
+    mimik_model: str = os.getenv("MIMIK_MODEL", "smollm-360m")
+    request_timeout: float = float(os.getenv("REQUEST_TIMEOUT", "30"))
+
+
+class WeatherAgent:
+    WEATHER_TERMS = {
+        "weather",
+        "temperature",
+        "forecast",
+        "rain",
+        "raining",
+        "snow",
+        "wind",
+        "humid",
+        "humidity",
+        "sunny",
+        "cloudy",
+    }
+
+    def __init__(
+        self,
+        settings: Optional[Settings] = None,
+        opener: JsonOpener = urlopen,
+    ) -> None:
+        self.settings = settings or Settings()
+        self.opener = opener
+
+    def answer(self, question: str) -> str:
+        question = question.strip()
+        if not question:
+            return "Please ask a weather question and include a location."
+        if not self._is_weather_question(question):
+            return "I can only answer weather questions."
+
+        location = self._extract_location(question)
+        if not location:
+            return "Which location would you like the weather for?"
+
+        place = self._geocode(location)
+        weather = self._current_weather(place["latitude"], place["longitude"])
+        return self._summarize(question, place, weather)
+
+    def _is_weather_question(self, question: str) -> bool:
+        words = set(re.findall(r"[a-z]+", question.lower()))
+        return bool(words & self.WEATHER_TERMS)
+
+    def _extract_location(self, question: str) -> Optional[str]:
+        normalized = question.strip().rstrip("?.!")
+        patterns = (
+            r"\b(?:in|at|for|near)\s+(.+)$",
+            r"\b(?:weather|forecast)\s+(.+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            if match:
+                location = match.group(1).strip()
+                location = re.sub(
+                    r"\b(?:today|tomorrow|right now|now|this week)$",
+                    "",
+                    location,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if location:
+                    return location
+        return None
+
+    def _request_json(self, request: Request) -> Dict[str, Any]:
+        with self.opener(request, timeout=self.settings.request_timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _geocode(self, location: str) -> Dict[str, Any]:
+        query = urlencode({"name": location, "count": 1, "language": "en", "format": "json"})
+        request = Request(f"https://geocoding-api.open-meteo.com/v1/search?{query}")
+        payload = self._request_json(request)
+        results = payload.get("results") or []
+        if not results:
+            raise ValueError(f"I could not find the location '{location}'.")
+        return results[0]
+
+    def _current_weather(self, latitude: float, longitude: float) -> Dict[str, Any]:
+        query = urlencode(
+            {
+                "latitude": latitude,
+                "longitude": longitude,
+                "current": (
+                    "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                    "precipitation,weather_code,wind_speed_10m"
+                ),
+                "timezone": "auto",
+            }
+        )
+        request = Request(f"https://api.open-meteo.com/v1/forecast?{query}")
+        payload = self._request_json(request)
+        if "current" not in payload:
+            raise RuntimeError("The weather service returned no current conditions.")
+        weather = dict(payload["current"])
+        weather["_units"] = payload.get("current_units", {})
+        return weather
+
+    def _summarize(
+        self,
+        question: str,
+        place: Dict[str, Any],
+        weather: Dict[str, Any],
+    ) -> str:
+        place_name = ", ".join(
+            str(value)
+            for value in (place.get("name"), place.get("admin1"), place.get("country"))
+            if value
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise weather assistant. Write one sentence using only the "
+                    "supplied Open-Meteo observation. Include the exact temperature and say "
+                    "that these are current conditions. Never name another provider, describe "
+                    "the interval, or add facts that are absent from the JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Question: {question}\nLocation: {place_name}\n"
+                    f"Current weather JSON: {json.dumps(weather, sort_keys=True)}"
+                ),
+            },
+        ]
+        body = json.dumps(
+            {
+                "model": self.settings.mimik_model,
+                "messages": messages,
+                "temperature": 0.2,
+                "stream": False,
+            }
+        ).encode("utf-8")
+        request = Request(
+            f"{self.settings.mimik_base_url.rstrip('/')}/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.settings.mimik_api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        payload = self._request_json(request)
+        try:
+            answer = str(payload["choices"][0]["message"]["content"]).strip()
+        except (KeyError, IndexError, TypeError) as error:
+            raise RuntimeError("mimOE returned an unexpected response.") from error
+
+        temperature = str(weather.get("temperature_2m", ""))
+        rejected_terms = ("weather underground", "interval", "provider", "source api")
+        normalized = answer.lower()
+        if (
+            temperature not in answer
+            or "current" not in normalized
+            or any(term in normalized for term in rejected_terms)
+            or len(answer) > 400
+        ):
+            return self._fallback_summary(place_name, weather)
+        return answer
+
+    def _fallback_summary(self, place_name: str, weather: Dict[str, Any]) -> str:
+        units = weather.get("_units", {})
+        temperature_unit = units.get("temperature_2m", "C")
+        wind_unit = units.get("wind_speed_10m", "km/h")
+        precipitation_unit = units.get("precipitation", "mm")
+        return (
+            f"Current conditions in {place_name}: "
+            f"{weather.get('temperature_2m')} {temperature_unit}, "
+            f"{weather.get('relative_humidity_2m')}% humidity, "
+            f"{weather.get('precipitation')} {precipitation_unit} precipitation, "
+            f"and wind at {weather.get('wind_speed_10m')} {wind_unit}."
+        )
